@@ -1,0 +1,48 @@
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# Jupyter cache
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Raw dataset
+# Do not upload original RAVDESS audio files
+# =========================
+/data/raw/RAVDESS/
+*.wav
+*.mp3
+*.flac
+*.m4a
+
+# =========================
+# Logs and temporary files
+# =========================
+*.log
+*.tmp
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# IDE files
+# =========================
+.vscode/
+.idea/
