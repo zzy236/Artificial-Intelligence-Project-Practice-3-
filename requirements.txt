@@ -8,3 +8,5 @@ soundfile>=0.12
 matplotlib>=3.7
 tqdm>=4.64
 praat-parselmouth>=0.4.3
+torch>=2.6,<3
+transformers>=4.46,<5

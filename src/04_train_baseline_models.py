@@ -1,7 +1,7 @@
 """
 04_train_baseline_models.py
 
-构建 RAVDESS 情绪分类传统机器学习基线。
+构建 RAVDESS 情绪分类基线，支持传统特征与冻结 SSL embedding 的公平对比。
 
 支持任务：
 1. four_class: neutral / happy / sad / angry 四分类
@@ -43,6 +43,11 @@ from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ALIGN_COLUMNS = ["sample_id", "file_name", "actor", "emotion"]
+FEATURE_TYPES = ["traditional", "wav2vec2", "hubert", "egemaps"]
+
+
 META_COLUMNS = {
     "sample_id",
     "file_name",
@@ -63,6 +68,9 @@ META_COLUMNS = {
     "gender",
     "load_error",
     "n_samples",
+    "target",
+    "feature_type",
+    "fold",
 }
 
 
@@ -70,6 +78,92 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
     """识别用于建模的数值特征列。"""
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     return [col for col in numeric_cols if col not in META_COLUMNS]
+
+
+def project_path(value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def align_feature_table(reference: pd.DataFrame, candidate: pd.DataFrame,
+                        feature_type: str) -> pd.DataFrame:
+    """按 sample_id 对齐，并拒绝样本缺失、重复或标签/说话人冲突。"""
+    for name, table in [("reference", reference), (feature_type, candidate)]:
+        missing = set(ALIGN_COLUMNS) - set(table.columns)
+        if missing:
+            raise ValueError(f"{name} 缺少样本对齐列：{sorted(missing)}")
+        if table[ALIGN_COLUMNS].isna().any().any() or table["sample_id"].duplicated().any():
+            raise ValueError(f"{name} 样本标识缺失或 sample_id 重复。")
+    if set(reference["sample_id"]) != set(candidate["sample_id"]):
+        raise ValueError(f"{feature_type} 与传统特征表的样本集合不同，不能公平比较。")
+    aligned = candidate.set_index("sample_id", drop=False).loc[reference["sample_id"]].reset_index(drop=True)
+    if not reference[ALIGN_COLUMNS].reset_index(drop=True).equals(aligned[ALIGN_COLUMNS]):
+        raise ValueError(f"{feature_type} 的文件名、说话人或情绪标签与传统特征不一致。")
+    return aligned
+
+
+def select_feature_columns(df: pd.DataFrame, feature_type: str) -> list[str]:
+    columns = get_feature_columns(df)
+    if feature_type in {"wav2vec2", "hubert"}:
+        expected = [f"{feature_type}_emb_{i:04d}" for i in range(1, 769)]
+        if any(col not in columns for col in expected):
+            raise ValueError(f"{feature_type} 需要完整的 768 维数值 embedding。")
+        columns = expected
+    elif feature_type == "egemaps" and len(columns) != 88:
+        raise ValueError(f"eGeMAPS Functionals 应有 88 维特征，实际为 {len(columns)}。")
+    if not columns:
+        raise ValueError(f"{feature_type} 没有可用于训练的数值特征。")
+    return columns
+
+
+def validate_cv_splits(df: pd.DataFrame, splits) -> np.ndarray:
+    """确保每条样本只测试一次、训练/测试说话人不交叉、训练包含全部类别。"""
+    counts = np.zeros(len(df), dtype=int)
+    assignments = np.zeros(len(df), dtype=int)
+    all_labels = set(df["target"])
+    for fold, (train, test) in enumerate(splits, start=1):
+        if not len(train) or not len(test):
+            raise ValueError("交叉验证中存在空训练集或测试集。")
+        if np.intersect1d(train, test).size:
+            raise ValueError("训练样本与测试样本发生交叉。")
+        if set(df.iloc[train]["actor"]) & set(df.iloc[test]["actor"]):
+            raise ValueError("训练说话人与测试说话人发生交叉。")
+        if set(df.iloc[train]["target"]) != all_labels:
+            raise ValueError(f"第 {fold} 折训练集缺少类别。")
+        counts[test] += 1
+        assignments[test] = fold
+    if not np.all(counts == 1):
+        raise ValueError("每条样本必须恰好作为测试样本一次。")
+    return assignments
+
+
+def restore_groupkfold_protocol(df: pd.DataFrame, fold_metrics_csv: Path,
+                                n_splits: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """复用原实验的测试说话人列表，避免库版本导致等大小分组的排序变化。"""
+    stored = pd.read_csv(fold_metrics_csv)
+    if not {"fold", "test_actors"}.issubset(stored.columns):
+        raise ValueError("折协议文件必须包含 fold、test_actors 列（fold_metrics.csv）。")
+    if stored[["fold", "test_actors"]].isna().any().any():
+        raise ValueError("折协议中有缺失的折号或测试说话人。")
+    if set(stored["fold"]) != set(range(1, n_splits + 1)):
+        raise ValueError(f"折协议必须包含连续的 {n_splits} 折。")
+    actors = df["actor"].astype(str).to_numpy()
+    all_actors = set(actors)
+    splits = []
+    for fold in range(1, n_splits + 1):
+        actor_lists = {
+            frozenset(part.strip() for part in str(value).split(","))
+            for value in stored.loc[stored["fold"] == fold, "test_actors"]
+        }
+        if len(actor_lists) != 1:
+            raise ValueError(f"折协议中第 {fold} 折的测试说话人列表不一致。")
+        test_actors = set(next(iter(actor_lists)))
+        if not test_actors or not test_actors.issubset(all_actors):
+            raise ValueError(f"折协议中第 {fold} 折包含当前数据不存在的说话人。")
+        mask = np.isin(actors, list(test_actors))
+        splits.append((np.flatnonzero(~mask), np.flatnonzero(mask)))
+    validate_cv_splits(df, splits)
+    return splits
 
 
 def prepare_task(df: pd.DataFrame, task: str) -> pd.DataFrame:
@@ -212,6 +306,8 @@ def train_and_evaluate(
     cv_name: str,
     n_splits: int,
     random_state: int,
+    feature_type: str = "traditional",
+    cv_splits: list[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """训练并评估所有模型。"""
     X = df[feature_cols].replace([np.inf, -np.inf], np.nan)
@@ -223,7 +319,9 @@ def train_and_evaluate(
     labels = label_encoder.classes_.tolist()
     n_classes = len(labels)
 
-    cv_splits = get_cv(groups=groups, cv_name=cv_name, n_splits=n_splits)
+    if cv_splits is None:
+        cv_splits = get_cv(groups=groups, cv_name=cv_name, n_splits=n_splits)
+    assignments = validate_cv_splits(df, cv_splits)
     models = build_models(random_state=random_state)
 
     summary_rows = []
@@ -231,7 +329,7 @@ def train_and_evaluate(
     prediction_rows = []
 
     for model_name, model in models.items():
-        print(f"[模型] {model_name}")
+        print(f"[模型] {feature_type} × {model_name}", flush=True)
 
         oof_pred = np.empty(len(df), dtype=object)
         oof_proba = np.full((len(df), n_classes), np.nan, dtype=float)
@@ -269,6 +367,7 @@ def train_and_evaluate(
             )
             fold_metrics.update({
                 "model": model_name,
+                "feature_type": feature_type,
                 "fold": fold_idx,
                 "n_train": len(train_idx),
                 "n_test": len(test_idx),
@@ -290,6 +389,9 @@ def train_and_evaluate(
             "n_classes": n_classes,
             "labels": ",".join(labels),
             "cv": cv_name,
+            "feature_type": feature_type,
+            "n_splits": len(cv_splits),
+            "random_state": random_state,
         })
 
         cm = confusion_matrix(y, oof_pred, labels=labels)
@@ -305,6 +407,8 @@ def train_and_evaluate(
                 "emotion": df.loc[i, "emotion"],
                 "target": y[i],
                 "model": model_name,
+                "feature_type": feature_type,
+                "fold": int(assignments[i]),
                 "y_true": y[i],
                 "y_pred": oof_pred[i],
             }
@@ -328,41 +432,75 @@ def json_dumps_matrix(matrix: list[list[int]]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train speaker-independent emotion classification baselines.")
     parser.add_argument("--features_csv", type=str, default="data/processed/ravdess_acoustic_features.csv")
-    parser.add_argument("--out_dir", type=str, default="results/tables")
+    parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument("--compare_features", action="store_true", help="对比 traditional/wav2vec2/hubert，复用同一组 CV 划分。")
+    parser.add_argument("--feature_sets", nargs="+", choices=FEATURE_TYPES, help="显式选择需要训练的特征类型。")
+    parser.add_argument("--wav2vec2_csv", default="data/processed/ravdess_wav2vec2_base_embeddings.csv")
+    parser.add_argument("--hubert_csv", default="data/processed/ravdess_hubert_base_embeddings.csv")
+    parser.add_argument("--egemaps_csv", help="可选的 88 维 eGeMAPS Functionals CSV，需带样本对齐列。")
+    parser.add_argument("--fold_protocol_csv", help="复用已有 fold_metrics.csv 中的说话人划分；比较模式六折默认复用原结果。")
     parser.add_argument("--task", type=str, default="four_class", choices=["four_class", "neutral_vs_negative"])
     parser.add_argument("--cv", type=str, default="groupkfold", choices=["groupkfold", "logo"])
     parser.add_argument("--n_splits", type=int, default=6)
     parser.add_argument("--random_state", type=int, default=42)
     args = parser.parse_args()
 
-    features_csv = Path(args.features_csv)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    selected = list(dict.fromkeys(args.feature_sets or (
+        ["traditional", "wav2vec2", "hubert"] if args.compare_features else ["traditional"]
+    )))
+    comparison = args.compare_features or args.feature_sets is not None
+    out_dir = project_path(args.out_dir or (
+        "results/tables/feature_comparison" if comparison else "results/tables"
+    ))
+    paths = {"traditional": args.features_csv, "wav2vec2": args.wav2vec2_csv,
+             "hubert": args.hubert_csv, "egemaps": args.egemaps_csv}
+    reference = pd.read_csv(project_path(args.features_csv))
+    # 在训练任何模型之前校验所有输入；统一对齐之后再按 task 筛选。
+    tables = {}
+    for feature_type in selected:
+        if not paths[feature_type]:
+            parser.error(f"选择 {feature_type} 必须提供 --{feature_type}_csv。")
+        candidate = (reference.copy() if feature_type == "traditional"
+                     else pd.read_csv(project_path(paths[feature_type])))
+        candidate = align_feature_table(reference, candidate, feature_type)
+        tables[feature_type] = prepare_task(candidate, task=args.task)
+        select_feature_columns(tables[feature_type], feature_type)
 
-    if not features_csv.exists():
-        raise FileNotFoundError(f"features_csv 不存在：{features_csv}")
-
-    df = pd.read_csv(features_csv)
-    df = prepare_task(df, task=args.task)
-    feature_cols = get_feature_columns(df)
-
-    if not feature_cols:
-        raise RuntimeError("没有识别到可用于训练的数值型声学特征列。")
-
-    print(f"[信息] 任务：{args.task}")
-    print(f"[信息] 样本数：{len(df)}")
-    print(f"[信息] 特征数：{len(feature_cols)}")
-    print("[信息] 类别分布：")
-    print(df["target"].value_counts().to_string())
-    print(f"[信息] 说话人数：{df['actor'].nunique()}")
-
-    summary_df, fold_df, pred_df = train_and_evaluate(
-        df=df,
-        feature_cols=feature_cols,
-        cv_name=args.cv,
-        n_splits=args.n_splits,
-        random_state=args.random_state,
+    canonical = prepare_task(reference, task=args.task)
+    if canonical.empty or canonical["target"].nunique() < 2:
+        raise ValueError("当前任务至少需要两个类别及非空样本。")
+    # 只生成一次划分，全部特征类型及分类器共享同一组训练/测试索引。
+    protocol_path = project_path(args.fold_protocol_csv) if args.fold_protocol_csv else None
+    original_protocol = project_path("results/tables/fold_metrics.csv")
+    if protocol_path is None and comparison and args.cv == "groupkfold" and args.n_splits == 6 and original_protocol.exists():
+        protocol_path = original_protocol
+    if protocol_path is not None:
+        if args.cv != "groupkfold":
+            parser.error("--fold_protocol_csv 只适用于 groupkfold。")
+        cv_splits = restore_groupkfold_protocol(canonical, protocol_path, args.n_splits)
+        print(f"[折协议] 复用已有 GroupKFold 的说话人划分：{protocol_path}", flush=True)
+    else:
+        cv_splits = get_cv(canonical["actor"].to_numpy(), args.cv, args.n_splits)
+    assignments = validate_cv_splits(canonical, cv_splits)
+    print(f"[协议] task={args.task}, cv={args.cv}, folds={len(cv_splits)}, "
+          f"samples={len(canonical)}, actors={canonical['actor'].nunique()}", flush=True)
+    outputs = []
+    for feature_type, df in tables.items():
+        feature_cols = select_feature_columns(df, feature_type)
+        print(f"[特征] {feature_type}: {len(feature_cols)} 维", flush=True)
+        outputs.append(train_and_evaluate(
+            df, feature_cols, args.cv, args.n_splits, args.random_state,
+            feature_type=feature_type, cv_splits=cv_splits,
+        ))
+    summary_df, fold_df, pred_df = (
+        pd.concat([output[i] for output in outputs], ignore_index=True) for i in range(3)
     )
+    for table in [summary_df, fold_df, pred_df]:
+        table["task"] = args.task
+    out_dir.mkdir(parents=True, exist_ok=True)
+    split_df = canonical[ALIGN_COLUMNS + ["target"]].copy()
+    split_df["fold"] = assignments
+    split_df.to_csv(out_dir / "cv_assignments.csv", index=False, encoding="utf-8-sig")
 
     summary_path = out_dir / "classification_results.csv"
     fold_path = out_dir / "fold_metrics.csv"
@@ -376,7 +514,7 @@ def main() -> None:
     print(f"[完成] 每折结果已保存：{fold_path}")
     print(f"[完成] 样本级预测结果已保存：{pred_path}")
     print("[信息] 分类结果摘要：")
-    print(summary_df[["model", "accuracy", "balanced_accuracy", "macro_f1", "auc"]].to_string(index=False))
+    print(summary_df[["feature_type", "model", "accuracy", "balanced_accuracy", "macro_f1", "auc"]].to_string(index=False))
 
 
 if __name__ == "__main__":
